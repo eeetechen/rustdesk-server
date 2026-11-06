@@ -864,6 +864,12 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // The controller's own public UDP port, as this server observed it. On a
+                    // symmetric NAT that port belongs to the controller's mapping for *this*
+                    // server and says nothing about the mapping it will get for the peer, so the
+                    // peer cannot aim at it - but it is the anchor its block of ports sits
+                    // around, which is all the peer needs to know where to search.
+                    udp_port: ph.udp_port,
                     ..Default::default()
                 });
             }
