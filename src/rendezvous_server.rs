@@ -36,7 +36,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
 
@@ -44,7 +44,7 @@ use std::{
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
     RelayServers0(String),
-    RelayServers(RelayServers),
+    RelayServers(RelayCandidates),
 }
 
 const REG_TIMEOUT: i64 = 30_000;
@@ -58,7 +58,22 @@ type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
+#[derive(Clone, Debug, Default)]
+struct RelayCandidate {
+    host: String,
+    // How long the last probe needed to reach this relay, or None before any probe has finished.
+    // This is an Option rather than a zero value because a relay on the same host answers in well
+    // under a millisecond, and a sentinel zero would make the fastest relay look unmeasured.
+    latency_ms: Option<u64>,
+}
+type RelayCandidates = Vec<RelayCandidate>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
+// How far behind the fastest reachable relay another one may be and still be chosen. Rotation is
+// how load is spread across relays, but it can only spread it among relays that are interchangeable
+// for a session: over the whole list it hands every Nth session to whichever relay is furthest
+// away, which on a spread-out deployment is the difference between a short detour and a long one
+// for the same bytes, chosen by nothing but arrival order.
+const RELAY_LATENCY_TOLERANCE_MS: u64 = 150;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 const MAX_RELAY_UUID_LEN: usize = 128;
 
@@ -125,7 +140,13 @@ pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
-    relay_servers: Arc<RelayServers>,
+    // Reachable relays, each with the latency its last probe measured. Selection picks among
+    // these; the configured list they came from is relay_servers0. This is behind a lock the
+    // clones share because selection runs on a clone per connection, while probes report back
+    // through the main loop: an Arc replaced there would leave every live connection reading the
+    // list from before the first probe finished, which is exactly the list selection exists to
+    // stop choosing from.
+    relay_servers: Arc<StdMutex<RelayCandidates>>,
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
@@ -311,7 +332,7 @@ impl RendezvousServer {
                     match data {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
-                        Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
+                        Data::RelayServers(rs) => { self.set_relay_candidates(rs); }
                     }
                 }
                 res = socket.next() => {
@@ -989,17 +1010,37 @@ impl RendezvousServer {
     fn parse_relay_servers(&mut self, relay_servers: &str) {
         let rs = get_servers(relay_servers, "relay-servers");
         self.relay_servers0 = Arc::new(rs);
-        self.relay_servers = self.relay_servers0.clone();
+        // Nothing has been probed yet, so every relay is a candidate and selection stays a
+        // rotation until the first round of checks reports latencies.
+        let candidates: RelayCandidates = self
+            .relay_servers0
+            .iter()
+            .map(|host| RelayCandidate {
+                host: host.clone(),
+                latency_ms: None,
+            })
+            .collect();
+        match self.relay_servers.lock() {
+            Ok(mut lock) => *lock = candidates,
+            Err(_) => log::error!("relay candidate list is poisoned; keeping the previous one"),
+        }
+    }
+
+    fn set_relay_candidates(&self, candidates: RelayCandidates) {
+        match self.relay_servers.lock() {
+            Ok(mut lock) => *lock = candidates,
+            Err(_) => log::error!("relay candidate list is poisoned; keeping the previous one"),
+        }
     }
 
     fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
-        if self.relay_servers.is_empty() {
-            return "".to_owned();
-        } else if self.relay_servers.len() == 1 {
-            return self.relay_servers[0].clone();
+        let turn = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst);
+        match self.relay_servers.lock() {
+            Ok(candidates) => select_relay(&candidates, turn).unwrap_or_default(),
+            // A poisoned list still has to produce a relay, or every session falls back to the
+            // relay-less path over a failure to read a hint.
+            Err(poisoned) => select_relay(&poisoned.into_inner(), turn).unwrap_or_default(),
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -1024,8 +1065,19 @@ impl RendezvousServer {
                 if let Some(rs) = fds.next() {
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
-                    for ip in self.relay_servers.iter() {
-                        let _ = writeln!(res, "{ip}");
+                    let candidates = match self.relay_servers.lock() {
+                        Ok(lock) => lock.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    for c in candidates.iter() {
+                        match c.latency_ms {
+                            Some(ms) => {
+                                let _ = writeln!(res, "{} {}ms", c.host, ms);
+                            }
+                            None => {
+                                let _ = writeln!(res, "{}", c.host);
+                            }
+                        }
                     }
                 }
             }
@@ -1349,6 +1401,33 @@ impl RendezvousServer {
     }
 }
 
+/// Picks the relay for one session, given the round-robin turn.
+///
+/// Rotation spreads load, but only across relays that are close enough to be interchangeable for
+/// a session: the configured order says nothing about distance, so rotating over all of them hands
+/// a share of sessions to a relay on the far side of the deployment, chosen by nothing but arrival
+/// order. Relays that are too far behind the fastest are left out of the rotation entirely. A relay
+/// nobody has probed yet stays eligible, because excluding it would rest on evidence that does not
+/// exist: probe results arrive after the first session does.
+fn select_relay(candidates: &[RelayCandidate], turn: usize) -> Option<String> {
+    let fastest = candidates.iter().filter_map(|c| c.latency_ms).min();
+    let eligible: Vec<&RelayCandidate> = match fastest {
+        Some(fastest) => candidates
+            .iter()
+            .filter(|c| match c.latency_ms {
+                None => true,
+                Some(ms) => ms <= fastest.saturating_add(RELAY_LATENCY_TOLERANCE_MS),
+            })
+            .collect(),
+        None => candidates.iter().collect(),
+    };
+    if eligible.is_empty() {
+        return None;
+    }
+    let i = turn % eligible.len();
+    Some(eligible[i].host.clone())
+}
+
 async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     let mut futs = Vec::new();
     let rs = Arc::new(Mutex::new(Vec::new()));
@@ -1360,11 +1439,17 @@ async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
         let rs = rs.clone();
         let x = x.clone();
         futs.push(tokio::spawn(async move {
+            // The handshake that asks whether the relay is up also times it: a relay that answers
+            // late is a relay this server would send a session's bytes through the long way.
+            let started = Instant::now();
             if FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT)
                 .await
                 .is_ok()
             {
-                rs.lock().await.push(x);
+                rs.lock().await.push(RelayCandidate {
+                    host: x,
+                    latency_ms: Some(started.elapsed().as_millis() as u64),
+                });
             }
         }));
     }
@@ -1519,5 +1604,49 @@ mod tests {
             assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
             assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
         }
+    }
+
+    #[test]
+    fn relay_selection_rotates_only_among_reachable_relays() {
+        let mk = |host: &str, latency_ms: Option<u64>| RelayCandidate {
+            host: host.to_owned(),
+            latency_ms,
+        };
+        // Nothing probed yet: every relay keeps its turn, and the order is the configured one.
+        let unprobed = vec![mk("a", None), mk("b", None), mk("c", None)];
+        let picked: Vec<_> = (0..3)
+            .map(|t| select_relay(&unprobed, t).unwrap_or_default())
+            .collect();
+        assert_eq!(picked, ["a", "b", "c"]);
+
+        // One relay answers late: it stops taking turns, and the rest keep rotating among
+        // themselves rather than the rotation skipping a slot for it.
+        let measured = vec![
+            mk("near", Some(20)),
+            mk("mid", Some(120)),
+            mk("far", Some(400)),
+        ];
+        let picked: Vec<_> = (0..6)
+            .map(|t| select_relay(&measured, t).unwrap_or_default())
+            .collect();
+        assert_eq!(picked, ["near", "mid", "near", "mid", "near", "mid"]);
+
+        // An unprobed relay is not evidence against it: it stays in the rotation even next to a
+        // measured one, because probe results arrive after the first session does.
+        let mixed = vec![mk("measured", Some(20)), mk("unknown", None)];
+        let picked: Vec<_> = (0..4)
+            .map(|t| select_relay(&mixed, t).unwrap_or_default())
+            .collect();
+        assert_eq!(picked, ["measured", "unknown", "measured", "unknown"]);
+
+        // A late relay comes back as soon as the fastest one slows to its level.
+        let shifted = vec![mk("was-fast", Some(300)), mk("was-far", Some(320))];
+        let picked: Vec<_> = (0..2)
+            .map(|t| select_relay(&shifted, t).unwrap_or_default())
+            .collect();
+        assert_eq!(picked, ["was-fast", "was-far"]);
+
+        // No relays configured at all is reported as absent, not as an empty host.
+        assert_eq!(select_relay(&[], 0), None);
     }
 }
